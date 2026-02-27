@@ -1,6 +1,8 @@
 {
     "name": "dominossauro/engine",
-    "type": "vcs",
+    "description": "Low-code flow processing engine for the Dominossauro platform",
+    "type": "library",
+    "license": "proprietary",
     "config": {
         "preferred-install": "source"
     },
