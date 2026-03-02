@@ -15,14 +15,6 @@
         "preferred-install": "source"
     },
     "require": {
-        "php": ">=8.0",
-        "dominossauro/sqlgenerator": "^1.0"
-    },
-    "repositories": [
-        {
-            "name": "dominossauro/sqlgenerator",
-            "type": "vcs",
-            "url": "git@github.com:dominossauro/sqlgenerator.git"
-        }
-    ]
+        "php": ">=8.0"
+    }
 }
