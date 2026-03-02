@@ -3,6 +3,14 @@
     "description": "Low-code flow processing engine for the Dominossauro platform",
     "type": "library",
     "license": "proprietary",
+    "keywords": ["low-code", "flow-engine", "orchestration", "api", "dominossauro"],
+    "homepage": "https://github.com/dominossauro/engine-php",
+    "authors": [
+        {
+            "name": "Dominossauro",
+            "email": "contato@dominossauro.com"
+        }
+    ],
     "config": {
         "preferred-install": "source"
     },
