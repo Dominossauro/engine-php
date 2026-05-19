@@ -3,13 +3,13 @@
 include_once 'FlowLog.class.php';
 include_once 'FlowContext.class.php';
 include_once 'CustomNodeHandler.class.php';
+include_once 'ClassReflector.class.php';
 include_once 'FlowProcessor.class.php';
 include_once 'LowCodeMiddleware.class.php';
 include_once 'LowCodeApi.class.php';
 
-global $flowLog;
-$flowLog = new FlowLog();
-$flowLog->log('Starting Engine...');
+// Inicializa o logger global usando a função segura
+getFlowLogger()->log('Starting Engine...');
 
 global $flowCtx;
 $flowCtx = new FlowContext();
@@ -26,7 +26,8 @@ class Engine
         'NodeResponse' => '/httpresponse/src/nodes/NodeResponse.class.php',
         'NodeQuery' => '/router/src/nodes/NodeQuery.class.php',
         'NodeAuth' => '/router/src/nodes/NodeAuth.class.php',
-        'NodeVariable' => '/engine/src/nodes/NodeVariable.class.php'
+        'NodeVariable' => '/engine/src/nodes/NodeVariable.class.php',
+        'NodeClassCaller' => '/engine/src/nodes/NodeClassCaller.class.php'
     ];
 
     public function handleEndpointRequest(array $apiJson, array $requestInfo) {
@@ -38,6 +39,13 @@ class Engine
 
         // Create FlowProcessor and register the controller
         $flowProcessor = new FlowProcessor([]);
+
+        // Configurar contexto de debug com o arquivo .dom (para breakpoints visuais)
+        $domFilePath = $requestInfo['domFilePath'] ?? null;
+        if ($domFilePath) {
+            $flowProcessor->setCurrentDebugContext($domFilePath, $currentPath, $currentMethod);
+        }
+
         if (!$flowProcessor->registerControllerFromJson($apiJson, $controllerName)) {
             (new HttpResponse())->statusCode(500)->json([
                 'error' => 'Failed to load controller',

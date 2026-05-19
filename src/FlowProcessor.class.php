@@ -6,6 +6,12 @@ class FlowProcessor
     // Controller registry: [controllerName => ['endpoints' => [], 'nodes' => []]]
     private array $controllers = [];
 
+    // Informações do arquivo/endpoint sendo processado (para debug)
+    private ?string $currentDomFilePath = null;
+    private ?string $currentEndpoint = null;
+    private ?string $currentMethod = null;
+    private array $customNodes = [];
+
     public function __construct(array $nodes)
     {
         $this->nodes = $nodes;
@@ -21,6 +27,21 @@ class FlowProcessor
     }
 
     /**
+     * Define o arquivo .dom e endpoint sendo processado (para debug)
+     */
+    public function setCurrentDebugContext(string $domFilePath, string $endpoint, string $method): void
+    {
+        $this->currentDomFilePath = $domFilePath;
+        $this->currentEndpoint = $endpoint;
+        $this->currentMethod = $method;
+
+        // Tornar global para acesso pelo Debugger
+        $GLOBALS['__DEBUG_DOM_FILE__'] = $domFilePath;
+        $GLOBALS['__DEBUG_ENDPOINT__'] = $endpoint;
+        $GLOBALS['__DEBUG_METHOD__'] = $method;
+    }
+
+    /**
      * Registra um controller a partir de um JSON string
      * @return bool true se registrou com sucesso
      */
@@ -28,13 +49,82 @@ class FlowProcessor
     {
         $data = $jsonContent;
 
+        // Enriquecer nodes com metadados de customNodes
+        $enrichedNodes = $this->enrichNodesWithCustomNodeMetadata($data['nodes'] ?? []);
+
         $this->controllers[$controllerName] = [
             'type' => 'controller',
             'endpoints' => $data['endpoints'] ?? [],
-            'nodes' => $data['nodes'] ?? [],
+            'nodes' => $enrichedNodes,
         ];
 
         return true;
+    }
+
+    /**
+     * Enriquece os nodes com metadados de customNodes do central.dom
+     * @param array $nodes Array de nodes
+     * @return array Nodes enriquecidos
+     */
+    private function enrichNodesWithCustomNodeMetadata(array $nodes): array
+    {
+        // Carregar customNodes do central.dom
+        $customNodesMap = $this->loadCustomNodesFromCentral();
+
+        if (empty($customNodesMap)) {
+            return $nodes;
+        }
+
+        // Enriquecer cada node que seja um customNode
+        foreach ($nodes as &$node) {
+            $type = $node['data']['type'] ?? ($node['type'] ?? null);
+
+            if ($type && isset($customNodesMap[$type])) {
+                $customNodeDef = $customNodesMap[$type];
+
+                // Adicionar metadados do customNode ao node
+                $node['_customNode'] = [
+                    'nodeClass' => $customNodeDef['nodeClass'] ?? null,
+                    'file' => $customNodeDef['file'] ?? null,
+                    'label' => $customNodeDef['label'] ?? null,
+                    'description' => $customNodeDef['description'] ?? null,
+                ];
+            }
+        }
+
+        return $nodes;
+    }
+
+    /**
+     * Carrega customNodes do central.dom e retorna um map por name
+     * @return array Map de customNodes indexado por name
+     */
+    private function loadCustomNodesFromCentral(): array
+    {
+        $centralDomPath = (new App())->getBasePathFromServer() . '/central.dom';
+
+        if (!file_exists($centralDomPath)) {
+            return [];
+        }
+
+        $centralDomContent = file_get_contents($centralDomPath);
+        $centralDomJson = json_decode($centralDomContent, true);
+
+        if (!isset($centralDomJson['customNodes']) || !is_array($centralDomJson['customNodes'])) {
+            return [];
+        }
+
+        $map = [];
+        foreach ($centralDomJson['customNodes'] as $customNode) {
+            $name = $customNode['name'] ?? null;
+            if ($name) {
+                $map[$name] = $customNode;
+            }
+        }
+
+        $this->customNodes = $map;
+
+        return $map;
     }
 
     /**
@@ -54,7 +144,7 @@ class FlowProcessor
 
         $controller = $this->controllers[$controllerName];
         $endpoints = $controller['endpoints'] ?? [];
-        
+
         // Delega para o Router fazer o matching e extração de path params
         $router = new Router();
         return $router->findMatchingEndpoint($endpoints, $method, $path, $pathParams);
@@ -67,11 +157,13 @@ class FlowProcessor
     public function executeController(string $controllerName, string $method, string $path): void
     {
         global $flowLog;
-        
+
+        global $httpResponse;
+
         // Encontra o endpoint correspondente e extrai os parâmetros de path
         $pathParams = [];
         $endpoint = $this->findMatchingEndpoint($controllerName, $method, $path, $pathParams);
-        
+
         if (!$endpoint) {
             $availableEndpoints = [];
             if (isset($this->controllers[$controllerName])) {
@@ -85,74 +177,73 @@ class FlowProcessor
                 'code' => 4004
             ];
             if(isset($_ENV['SHOW_EXCEPTIONS']) && $_ENV['SHOW_EXCEPTIONS']) {
-                $response['exception'] = $flowLog->getLastException();
+                $response['exception'] = (is_object($flowLog) && method_exists($flowLog, 'getLastException')) ? $flowLog->getLastException() : null;
                 $response['method'] = $method;
                 $response['path'] = $path;
                 $response['availableEndpoints'] = $availableEndpoints;
             }
-
-            (new HttpResponse())->statusCode(404)->json($response);
+            if (class_exists('\PhpDebugger\\Debugger')) {
+                try { \PhpDebugger\Debugger::onRequestEnd(); } catch (\Throwable $e) {}
+            }
+            $httpResponse->statusCode(404)->json($response);
             return;
         }
 
         // Encontra o nó inicial
         $startNodeId = $this->findStartNodeIdForEndpoint($endpoint);
-        
+
         if (!$startNodeId) {
-            (new HttpResponse())->statusCode(500)->json([
+            $httpResponse->statusCode(500)->json([
                 'error' => 'Nó inicial não encontrado para o endpoint',
                 'endpoint' => $endpoint,
                 'controller' => $controllerName,
-                'logs' => $flowLog->getLogs(),
+                'logs' => getFlowLogger()->getLogs(),
                 'code' => 5007
             ]);
             return;
         }
 
-        if ($flowLog) {
-            $flowLog->log("✓ Executando fluxo a partir do nó: {$startNodeId}");
-            if (!empty($pathParams)) {
-                $flowLog->log("✓ Parâmetros de path extraídos: " . json_encode($pathParams));
-            }
+        getFlowLogger()->log("✓ Executando fluxo a partir do nó: {$startNodeId}");
+        if (!empty($pathParams)) {
+            getFlowLogger()->log("✓ Parâmetros de path extraídos: " . json_encode($pathParams));
         }
 
         // Executa o fluxo
         $request = new HttpRequest();
         $request->loadPathParams($pathParams);
-        
+
         $context = [
             'request' => $request,
-            'response' => new HttpResponse(),
+            'response' => $httpResponse,
         ];
-        
+
         // Torna o contexto global para acesso em toda a aplicação
         $GLOBALS['flowContext'] = $context;
 
+        // Inicializa o FlowContext para armazenar variáveis e dados dos nodes
+        $GLOBALS['flowCtx'] = new FlowContext();
+
         try {
             $this->simulateExecution($startNodeId, $context);
-            $response = [
-                'message' => 'Executado com sucesso e não finalizado por nenhum nó.',
-            ];
 
-            if(isset($_ENV['SHOW_EXCEPTIONS']) && $_ENV['SHOW_EXCEPTIONS'])
-            {
-                $response['logs'] = $flowLog->getLogs();
-            }
             // Se chegou aqui sem resposta, retorna os logs
-            (new HttpResponse())->statusCode(200)->json([
+            $httpResponse->statusCode(200)->json([
                 'message' => 'Executado com sucesso',
             ]);
+            return;
+
         } catch (Exception $e) {
             $response = [
                 'error' => 'Erro ao executar fluxo',
                 'message' => $e->getMessage(),
                 'code' => 5008
             ];
-            if(isset($_ENV['SHOW_EXCEPTIONS']) && $_ENV['SHOW_EXCEPTIONS'])
-            {
-                $response['exception'] = $flowLog->getLastException();
+            if(isset($_ENV['SHOW_EXCEPTIONS']) && $_ENV['SHOW_EXCEPTIONS']) {
+                $response['exception'] = (is_object($flowLog) && method_exists($flowLog, 'getLastException')) ? $flowLog->getLastException() : null;
             }
-            (new HttpResponse())->statusCode(500)->json($response);
+
+            $httpResponse->statusCode(500)->json($response);
+            return;
         }
     }
 
@@ -171,18 +262,16 @@ class FlowProcessor
     public function findStartNodeIdForEndpoint(array $endpoint): ?string
     {
         global $flowLog;
-        
+
         $endpointId = $endpoint['id'] ?? null;
         $method = strtoupper($endpoint['method'] ?? 'GET');
         $path = $endpoint['path'] ?? ($endpoint['url'] ?? null);
-        
-        if ($flowLog) {
-            $flowLog->log("→ Buscando nó inicial para endpoint: method={$method}, path={$path}, endpointId={$endpointId}");
-            $flowLog->log("  Controllers disponíveis: " . implode(', ', array_keys($this->controllers)));
-        }
-        
+
+        getFlowLogger()->log("→ Buscando nó inicial para endpoint: method={$method}, path={$path}, endpointId={$endpointId}");
+
+
         if (!$path) {
-            if ($flowLog) $flowLog->log("  ✗ Path não fornecido");
+            getFlowLogger()->log("  ✗ Path não fornecido");
             return null;
         }
 
@@ -195,97 +284,68 @@ class FlowProcessor
             default => strtolower($method),
         };
 
-        if ($flowLog) {
-            $flowLog->log("  Tipo de nó esperado: {$type}");
-        }
+        getFlowLogger()->log("  Tipo de nó esperado: {$type}");
 
         // Controller name must be the first path segment
         $controllerName = $this->extractControllerFromPath($path);
-        
-        if ($flowLog) {
-            $flowLog->log("  Controller extraído do path: {$controllerName}");
-        }
-        
+
+        getFlowLogger()->log("  Controller extraído do path: {$controllerName}");
+
         if (!$controllerName || !isset($this->controllers[$controllerName])) {
-            if ($flowLog) {
-                $flowLog->log("  ✗ Controller '{$controllerName}' não encontrado ou não registrado");
-            }
+            getFlowLogger()->log("  ✗ Controller '{$controllerName}' não encontrado ou não registrado");
             return null;
         }
-        
+
         $controller = $this->controllers[$controllerName];
-        
-        if ($flowLog) {
-            $flowLog->log("  ✓ Controller encontrado. Nodes disponíveis: " . count($controller['nodes'] ?? []));
-        }
+
+        getFlowLogger()->log("  ✓ Controller encontrado. Nodes disponíveis: " . count($controller['nodes'] ?? []));
 
         // 1) Try direct candidate pattern within controller: "{type}-{endpointId}"
         if ($endpointId) {
             $candidate = "{$type}-{$endpointId}";
-            if ($flowLog) {
-                $flowLog->log("  Tentando candidato direto: {$candidate}");
-            }
+            getFlowLogger()->log("  Tentando candidato direto: {$candidate}");
             foreach (($controller['nodes'] ?? []) as $n) {
                 if (($n['id'] ?? '') === $candidate) {
-                    if ($flowLog) {
-                        $flowLog->log("  ✓ Nó inicial encontrado (candidato direto): {$candidate}");
-                    }
+                    getFlowLogger()->log("  ✓ Nó inicial encontrado (candidato direto): {$candidate}");
                     return $candidate;
                 }
             }
-            if ($flowLog) {
-                $flowLog->log("  ✗ Candidato direto não encontrado");
-            }
+            getFlowLogger()->log("  ✗ Candidato direto não encontrado");
         }
 
         // 2) Fallback: scan controller nodes by (data.endpointId + data.type) and path prefix "/{controllerName}"
-        if ($flowLog) {
-            $flowLog->log("  Fazendo scan nos nodes do controller...");
-        }
-        
+        getFlowLogger()->log("  Fazendo scan nos nodes do controller...");
+
         foreach (($controller['nodes'] ?? []) as $n) {
             $data = $n['data'] ?? [];
             $nodeType = $data['type'] ?? null;
             $nodeEndpointId = $data['endpointId'] ?? null;
-            
-            if ($flowLog) {
-                $flowLog->log("    Analisando node: id={$n['id']}, type={$nodeType}, endpointId={$nodeEndpointId}");
-            }
-            
+
+            getFlowLogger()->log("    Analisando node: id={$n['id']}, type={$nodeType}, endpointId={$nodeEndpointId}");
+
             if ($nodeType !== $type) {
-                if ($flowLog) {
-                    $flowLog->log("      ✗ Tipo não corresponde (esperado: {$type}, encontrado: {$nodeType})");
-                }
+                getFlowLogger()->log("      ✗ Tipo não corresponde (esperado: {$type}, encontrado: {$nodeType})");
                 continue;
             }
 
             // Ensure node path respects controller prefix if declared
             if (!$this->endpointMatchesControllerPath($controllerName, $path, $data)) {
-                if ($flowLog) {
-                    $flowLog->log("      ✗ Path não corresponde ao controller");
-                }
+                getFlowLogger()->log("      ✗ Path não corresponde ao controller");
                 continue;
             }
 
             if ($endpointId && (($data['endpointId'] ?? null) === $endpointId)) {
-                if ($flowLog) {
-                    $flowLog->log("      ✓ Nó inicial encontrado (scan): {$n['id']}");
-                }
+                getFlowLogger()->log("      ✓ Nó inicial encontrado (scan): {$n['id']}");
                 return $n['id'];
             }
             // If no endpointId provided or not matched, accept the first matching node
             if (!$endpointId) {
-                if ($flowLog) {
-                    $flowLog->log("      ✓ Nó inicial encontrado (primeiro match): {$n['id']}");
-                }
+                getFlowLogger()->log("      ✓ Nó inicial encontrado (primeiro match): {$n['id']}");
                 return $n['id'];
             }
         }
 
-        if ($flowLog) {
-            $flowLog->log("  ✗ Nenhum nó inicial encontrado após scan completo");
-        }
-        
+        getFlowLogger()->log("  ✗ Nenhum nó inicial encontrado após scan completo");
         return null;
     }
 
@@ -319,6 +379,7 @@ class FlowProcessor
         global $flowLog;
         $currentNodeId = $startNodeId;
         $visited = [];
+        $nodeCounter = 0;
 
         while ($currentNodeId && !isset($visited[$currentNodeId])) {
             $visited[$currentNodeId] = true;
@@ -326,31 +387,162 @@ class FlowProcessor
             if (!$node)
                 break;
 
+            $nodeCounter++;
             $type = $node['data']['type'] ?? ($node['type'] ?? 'unknown');
             $label = $node['data']['label'] ?? ($node['id'] ?? 'node');
-            $flowLog->log("Executando node [{$node['id']}] tipo={$type} label={$label}");
+
+            getFlowLogger()->log("Executando node [{$node['id']}] tipo={$type} label={$label}");
+
+            $shouldPause = false;
+            $stepModeBeforePause = false;
+
+            // Verificar se está em step mode
+            if ($this->isDebugStepMode()) {
+                $stepModeBeforePause = true;
+                $shouldPause = true;
+                getFlowLogger()->log("DEBUG STEP: Pausando no node [{$node['id']}]");
+            }
+            elseif (isset($node['data']['breakpoint']) && $node['data']['breakpoint'] === true) {
+                getFlowLogger()->log("BREAKPOINT ATIVO no node [{$node['id']}]");
+                $shouldPause = true;
+            }
+
+            if ($shouldPause) {
+                $this->handleBreakpoint($node, $context);
+            }
 
             $node['data'] = $this->replaceVariablesInNodeData($node['data'] ?? []);
             $outputType = $this->callNodeExecute($type, $node, $context);
+
             if ($outputType === null) {
-                $flowLog->log("  [Aviso] Node [{$type}][{$node['id']}] não retornou outputType. Fluxo pode parar aqui.");
+                getFlowLogger()->log("  [Aviso] Node [{$type}][{$node['id']}] não retornou outputType. Fluxo pode parar aqui.");
             }
 
-            // Busca o próximo node baseado no output retornado
-            $currentNodeId = $this->findNextNodeIdByOutput($node['outputs'], $outputType);
+            $nextConnections = $this->findNextNodesByOutput($node['outputs'], $outputType);
+
+            if (empty($nextConnections)) {
+                getFlowLogger()->log("🏁 FIM DO FLUXO (sem próximo node)");
+                $currentNodeId = null;
+            } else {
+                $totalConns = count($nextConnections);
+
+                if ($totalConns > 1) {
+                    getFlowLogger()->log("🔀 Output '{$outputType}' tem {$totalConns} conexões");
+                }
+
+                // Conexões adicionais (order 2, 3, ...): executar como subflows sequenciais
+                for ($i = 1; $i < $totalConns; $i++) {
+                    $conn = $nextConnections[$i];
+                    $order = $conn['order'] ?? ($i + 1);
+                    getFlowLogger()->log("  ↳ Executando branch {$order}/{$totalConns} → {$conn['toNodeId']}");
+                    $this->executeBranch($conn['toNodeId'], $context);
+                }
+
+                // Primeira conexão (order 1): continua o loop principal
+                $currentNodeId = $nextConnections[0]['toNodeId'];
+                getFlowLogger()->log("➡️  Próximo node: $currentNodeId");
+            }
         }
 
+        getFlowLogger()->log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        getFlowLogger()->log("✅ FLUXO COMPLETO");
+        getFlowLogger()->log("   Total de nodes executados: $nodeCounter");
+        getFlowLogger()->log("   Nodes: " . implode(' → ', array_keys($visited)));
+        getFlowLogger()->log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    }
+
+    /**
+     * Verifica se o debugger está em modo step
+     * @return bool
+     */
+    private function isDebugStepMode(): bool
+    {
+        if (!class_exists('PhpDebugger\\Debugger')) {
+            return false;
+        }
+
+        if (!method_exists('PhpDebugger\\Debugger', 'isStepMode')) {
+            return false;
+        }
+
+        return \PhpDebugger\Debugger::isStepMode();
+    }
+
+    /**
+     * Manipula a pausa de execução quando um breakpoint é atingido
+     */
+    private function handleBreakpoint(array $node, array $context): void
+    {
+        global $flowLog, $flowCtx;
+
+        // Verificar se o Debugger está disponível
+        if (!class_exists('PhpDebugger\\Debugger')) {
+            getFlowLogger()->log("⚠️ Debugger não disponível - ignorando breakpoint");
+            return;
+        }
+
+        // Preparar contexto do node para o debugger
+        $debugContext = [
+            'nodeId' => $node['id'],
+            'nodeType' => $node['data']['type'] ?? 'unknown',
+            'nodeLabel' => $node['data']['label'] ?? $node['id'],
+            'nodeSummary' => $node['data']['summary'] ?? '',
+            'nodeData' => $node['data'] ?? [],
+            'nodePosition' => [
+                'x' => $node['position']['x'] ?? 0,
+                'y' => $node['position']['y'] ?? 0,
+            ],
+            'file' => $GLOBALS['__DEBUG_DOM_FILE__'] ?? __FILE__,
+            'line' => __LINE__,
+            'domFilePath' => $GLOBALS['__DEBUG_DOM_FILE__'] ?? null,
+            'endpoint' => $GLOBALS['__DEBUG_ENDPOINT__'] ?? null,
+            'method' => $GLOBALS['__DEBUG_METHOD__'] ?? null,
+        ];
+
+        // Coletar variáveis disponíveis no contexto
+        $availableVariables = [
+            'node' => $node,
+            'context' => $context,
+            'request' => $context['request'] ?? null,
+            'response' => $context['response'] ?? null,
+        ];
+
+        // Se tiver flowCtx, adicionar dados dos nodes anteriores
+        if (isset($flowCtx) && is_object($flowCtx) && method_exists($flowCtx, 'getAllNodeData')) {
+            $availableVariables['flowData'] = $flowCtx->getAllNodeData();
+        }
+
+        getFlowLogger()->log("🔴 Pausando execução no node: {$debugContext['nodeId']}");
+        getFlowLogger()->log("   Tipo: {$debugContext['nodeType']}");
+        getFlowLogger()->log("   Label: {$debugContext['nodeLabel']}");
+
+        // Definir contexto atual no Debugger
+        \PhpDebugger\Debugger::setCurrentNode($debugContext);
+
+        // Salvar referências antes do breakpoint (debug_capture.php pode corromper globals)
+        $__savedFlowCtx__ = $flowCtx;
+        $__savedFlowLog__ = $flowLog;
+
+        // Pausar execução e aguardar comando do VS Code
+        include BREAKPOINT;
+
+        // Restaurar globals após o breakpoint
+        global $flowLog, $flowCtx;
+        $flowCtx = $__savedFlowCtx__;
+        $flowLog = $__savedFlowLog__;
+        unset($__savedFlowCtx__, $__savedFlowLog__);
     }
 
     private function callNodeExecute(string $type, array $node, array $context): ?string
     {
         global $flowLog;
         $outputType = null;
+
         if (class_exists('Node' . ucfirst($type))) {
             $className = 'Node' . ucfirst($type);
             if (method_exists($className, 'execute')) {
-                // O execute deve retornar o output desejado (ex: 'out', 'error', etc)
                 $returnedData = (new $className())->execute($node ?? [], $context);
+                getFlowLogger()->log("🔧 [{$type}] Retorno bruto: " . json_encode($returnedData, JSON_UNESCAPED_UNICODE));
                 $outputType = $returnedData['output'] ?? null;
                 $nodeData = $returnedData['data'] ?? null;
                 if ($nodeData !== null) {
@@ -358,48 +550,69 @@ class FlowProcessor
                     $flowCtx->setNodeData($node['id'], $outputType, $nodeData);
                 }
             } else {
-                $flowLog->log('Método execute() não encontrado na classe Node' . ucfirst($type) . '.');
+                getFlowLogger()->log('Método execute() não encontrado na classe Node' . ucfirst($type) . '.');
             }
         } else {
-            //check insider the folder central.dom.
-            //$flowLog->log('Classe Node' . ucfirst($type) . ' não encontrada.');
-            (new CustomNodeHandler())->handle(ucfirst($type));
-            if (class_exists(ucfirst($type))) {
-                $className = ucfirst($type);
-                if (method_exists($className, 'execute')) {
-                    // O execute deve retornar o output desejado (ex: 'out', 'error', etc)
-                    $returnedData = (new $className())->execute($node ?? [], $context);
-                    $outputType = $returnedData['output'] ?? null;
-                    $nodeData = $returnedData['data'] ?? null;
-                    if ($nodeData !== null) {
-                        global $flowCtx;
-                        $flowCtx->setNodeData($node['id'], $outputType, $nodeData);
-                    }
-                } else {
-                    $flowLog->log('Método execute() não encontrado na classe Node' . ucfirst($type) . '.');
-                }
-            } else {
-                $flowLog->log('Classe Node' . ucfirst($type) . ' não encontrada.');
+            // Usar CustomNodeHandler com o mapa de customNodes já carregado
+            $customNodeHandler = new CustomNodeHandler($this->customNodes);
+
+            try {
+                $returnedData = $customNodeHandler->execute($type, $node, $context);
+
+                getFlowLogger()->log("🔧 [Custom {$type}] Retorno bruto: " . json_encode($returnedData, JSON_UNESCAPED_UNICODE));
+
+                $outputType = $returnedData['output'] ?? null;
+                $nodeData = $returnedData['data'] ?? null;
+            } catch (Exception $e) {
+                getFlowLogger()->log("❌ ERRO ao executar custom node '$type': " . $e->getMessage());
+                throw $e;
             }
         }
         return $outputType;
     }
 
     /**
-     * Busca o próximo nodeId a partir do node atual e do output retornado.
+     * Retorna array de conexões ordenadas por 'order' para um dado output type.
+     * Suporta tanto o formato novo (connections[]) quanto o legado (toNodeId direto).
+     * @return array<array{toNodeId: string, inputType: string, order: int}>
+     */
+    private function findNextNodesByOutput(array $outputs, ?string $output): array
+    {
+        if (!$outputs || !$output || !isset($outputs[$output])) {
+            return [];
+        }
+
+        $outputData = $outputs[$output];
+
+        // Novo formato: connections[]
+        if (isset($outputData['connections']) && is_array($outputData['connections'])) {
+            $connections = $outputData['connections'];
+            usort($connections, fn($a, $b) => ($a['order'] ?? 0) - ($b['order'] ?? 0));
+            return $connections;
+        }
+
+        // Formato legado: toNodeId direto
+        if (isset($outputData['toNodeId']) && $outputData['toNodeId'] !== null) {
+            return [
+                [
+                    'toNodeId' => $outputData['toNodeId'],
+                    'inputType' => $outputData['inputType'] ?? 'in',
+                    'order' => 1,
+                ]
+            ];
+        }
+
+        return [];
+    }
+
+    /**
+     * Atalho de compatibilidade: retorna o primeiro toNodeId de um output.
+     * Usado internamente quando só se precisa do próximo node (ex: subflows simples).
      */
     private function findNextNodeIdByOutput(array $outputs, ?string $output): ?string
     {
-        if (!$outputs || !$output) {
-            return null;
-        }
-
-        // verifica se a chave existe antes de acessar
-        if (!isset($outputs[$output])) {
-            return null;
-        }
-
-        return $outputs[$output]['toNodeId'] ?? null;
+        $connections = $this->findNextNodesByOutput($outputs, $output);
+        return $connections[0]['toNodeId'] ?? null;
     }
 
     /**
@@ -416,6 +629,11 @@ class FlowProcessor
                     // Regex: {{nodeId.output.var1(.var2...)?}}
                     '/{{([\w-]+)\.([\w-]+)\.([\w.-]+)}}/',
                     function ($matches) use ($flowCtx) {
+                        // Verificar se $flowCtx é um objeto válido
+                        if (!is_object($flowCtx) || !method_exists($flowCtx, 'getNodeData')) {
+                            return $matches[0]; // Retorna string original se $flowCtx inválido
+                        }
+
                         $nodeId = $matches[1];  // ex: auth-1756961658756
                         $output = $matches[2];  // ex: out
                         $path = $matches[3];  // ex: variable1.variable2.variable3
@@ -459,14 +677,24 @@ class FlowProcessor
      */
     public function runSubflowFromOutput(array $currentNode, string $outputKey, array $context = []): void
     {
-        global $flowLog;
         $startNodeId = $this->findNextNodeIdByOutput($currentNode['outputs'] ?? [], $outputKey);
         if (!$startNodeId) {
             return; // nada conectado a este output
         }
 
+        $this->executeBranch($startNodeId, $context, "[Subflow {$outputKey}]");
+    }
+
+    /**
+     * Executa uma branch (subfluxo) a partir de um node, compartilhando o mesmo FlowContext.
+     * Usado quando um output tem múltiplas conexões e para subflows (loop, etc.).
+     * Cada branch tem seu próprio controle de ciclo (visited).
+     */
+    private function executeBranch(string $startNodeId, array $context, string $logPrefix = '[Branch]'): void
+    {
         $visited = [];
         $nodeId = $startNodeId;
+
         while ($nodeId && !isset($visited[$nodeId])) {
             $visited[$nodeId] = true;
             $node = $this->getNode($nodeId);
@@ -474,13 +702,34 @@ class FlowProcessor
 
             $type = $node['data']['type'] ?? ($node['type'] ?? 'unknown');
             $label = $node['data']['label'] ?? ($node['id'] ?? 'node');
-            $flowLog && $flowLog->log("[Subflow {$outputKey}] Executando node [{$node['id']}] tipo={$type} label={$label}");
+            getFlowLogger()->log("{$logPrefix} Executando node [{$node['id']}] tipo={$type} label={$label}");
 
             $node['data'] = $this->replaceVariablesInNodeData($node['data'] ?? []);
             $out = $this->callNodeExecute($type, $node, $context);
 
-            // avança no subfluxo conforme o output retornado
-            $nodeId = $this->findNextNodeIdByOutput($node['outputs'] ?? [], $out);
+            if ($out === null) {
+                getFlowLogger()->log("{$logPrefix} Node [{$node['id']}] não retornou output. Branch encerrada.");
+                break;
+            }
+
+            $nextConnections = $this->findNextNodesByOutput($node['outputs'] ?? [], $out);
+
+            if (empty($nextConnections)) {
+                getFlowLogger()->log("{$logPrefix} 🏁 Fim da branch (sem próximo node)");
+                break;
+            }
+
+            // Branches adicionais deste node (recursivo)
+            $totalConns = count($nextConnections);
+            for ($i = 1; $i < $totalConns; $i++) {
+                $conn = $nextConnections[$i];
+                $order = $conn['order'] ?? ($i + 1);
+                getFlowLogger()->log("{$logPrefix}   ↳ Sub-branch {$order}/{$totalConns} → {$conn['toNodeId']}");
+                $this->executeBranch($conn['toNodeId'], $context, "{$logPrefix}>{$order}");
+            }
+
+            // Continua a branch principal (primeira conexão)
+            $nodeId = $nextConnections[0]['toNodeId'] ?? null;
         }
     }
 }

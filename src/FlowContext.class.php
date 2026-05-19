@@ -34,4 +34,21 @@ class FlowContext
         }
         return $this->nodeData[$nodeId] ?? null;
     }
+
+    /**
+     * Retorna todos os dados de todos os nodes processados
+     * Útil para debug e inspeção do estado do flow
+     */
+    public function getAllNodeData()
+    {
+        return $this->nodeData;
+    }
+
+    /**
+     * Retorna todas as variáveis do contexto
+     */
+    public function getAllVariables()
+    {
+        return $this->variables;
+    }
 }

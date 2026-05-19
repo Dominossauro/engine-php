@@ -14,3 +14,15 @@ class FlowLog
         return $this->logs;
     }
 }
+
+function getFlowLogger() {
+    global $flowLog;
+    if (!isset($flowLog) || !is_object($flowLog)) {
+        $flowLog = new FlowLog();
+    }
+    return $flowLog;
+}
+
+function logFlow($message) {
+    getFlowLogger()->log($message);
+}

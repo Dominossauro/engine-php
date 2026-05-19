@@ -17,6 +17,7 @@ class NodeSetVariableValue
     public function handleVariable(array $config, array $context): void
     {
         global $flowCtx;
-        $flowCtx->setVariable($config['variableName'], $config['value']);
+        $data = $config['data'] ?? $config;
+        $flowCtx->setVariable($data['variableName'] ?? '', $data['value'] ?? null);
     }
 }
